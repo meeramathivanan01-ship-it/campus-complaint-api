@@ -1,1 +1,2 @@
 fastapi==0.141.1
+SQLAlchemy==2.1.1
