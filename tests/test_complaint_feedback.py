@@ -1,11 +1,14 @@
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from fastapi import HTTPException
 from pydantic import ValidationError
+from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
+from app.database import Base
 from app.models import Complaint, ComplaintFeedback, User
 from app.routers.complaints import router, submit_complaint_feedback
 from app.schemas import ComplaintFeedbackCreate, ComplaintFeedbackResponse
@@ -46,9 +49,10 @@ class ComplaintFeedbackTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     ComplaintFeedbackCreate(rating=rating)
 
-    def test_owner_can_submit_feedback_for_resolved_complaint(self) -> None:
+    def test_owner_feedback_closes_resolved_complaint(self) -> None:
+        complaint = make_complaint()
         db = Mock()
-        db.scalar.side_effect = [make_complaint(), None]
+        db.scalar.side_effect = [complaint, None]
         db.refresh.side_effect = lambda feedback: (
             setattr(feedback, "id", 11),
             setattr(feedback, "created_at", datetime.now(timezone.utc)),
@@ -62,6 +66,7 @@ class ComplaintFeedbackTests(unittest.TestCase):
         self.assertEqual(result.student_id, 4)
         self.assertEqual(result.rating, 5)
         self.assertEqual(result.comment, "Thank you")
+        self.assertEqual(complaint.status, "closed")
         db.commit.assert_called_once()
         response = ComplaintFeedbackResponse.model_validate(result)
         self.assertNotIn("password", response.model_dump())
@@ -87,7 +92,7 @@ class ComplaintFeedbackTests(unittest.TestCase):
         self.assertEqual(query.compile().params["student_id_1"], 9)
         db.add.assert_not_called()
 
-    def test_feedback_requires_resolved_or_closed_complaint(self) -> None:
+    def test_feedback_requires_resolved_complaint(self) -> None:
         db = Mock()
         db.scalar.return_value = make_complaint(status="in_progress")
 
@@ -98,6 +103,18 @@ class ComplaintFeedbackTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(db.scalar.call_count, 1)
+        db.add.assert_not_called()
+
+    def test_feedback_is_rejected_for_closed_complaint(self) -> None:
+        db = Mock()
+        db.scalar.return_value = make_complaint(status="closed")
+
+        with self.assertRaises(HTTPException) as raised:
+            submit_complaint_feedback(
+                24, ComplaintFeedbackCreate(rating=4), make_user(), db
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
         db.add.assert_not_called()
 
     def test_duplicate_feedback_is_rejected(self) -> None:
@@ -124,6 +141,57 @@ class ComplaintFeedbackTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 409)
         db.rollback.assert_called_once()
+
+    def test_commit_failure_rolls_back_feedback_and_closure(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        try:
+            with Session(engine) as db:
+                student = User(
+                    id=4,
+                    name="Feedback Student",
+                    email="student@example.com",
+                    password="hash",
+                    role="student",
+                )
+                complaint = Complaint(
+                    id=24,
+                    title="Fixed sink",
+                    description="Sink was repaired",
+                    category="Plumbing",
+                    priority="medium",
+                    status="resolved",
+                    location="Hall",
+                    student_id=4,
+                )
+                db.add_all([student, complaint])
+                db.commit()
+
+                with patch.object(
+                    db, "commit", side_effect=RuntimeError("database unavailable")
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "database unavailable"
+                    ):
+                        submit_complaint_feedback(
+                            24,
+                            ComplaintFeedbackCreate(rating=4),
+                            student,
+                            db,
+                        )
+
+                db.expire_all()
+                self.assertEqual(db.get(Complaint, 24).status, "resolved")
+                self.assertIsNone(
+                    db.scalar(
+                        select(ComplaintFeedback).where(
+                            ComplaintFeedback.complaint_id == 24
+                        )
+                    )
+                )
+        finally:
+            Base.metadata.drop_all(engine)
+            engine.dispose()
 
     def test_only_students_can_submit_feedback(self) -> None:
         route = next(

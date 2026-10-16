@@ -32,12 +32,24 @@ STATUS_TRANSITIONS = {
 }
 
 
-@router.get("/health")
+@router.get(
+    "/health",
+    summary="Health Check — Public Access",
+    description="Public Access. No authentication is required.",
+)
 def complaints_health() -> dict[str, str]:
     return {"message": "Complaints router is working."}
 
 
-@router.get("/", response_model=list[ComplaintResponse])
+@router.get(
+    "/",
+    response_model=list[ComplaintResponse],
+    summary="Get Complaints — Student / Admin Access",
+    description=(
+        "Student / Admin Access. Students see only their own complaints; admins "
+        "can see all complaints."
+    ),
+)
 def get_complaints(
     current_user: User = Depends(require_roles("student", "admin")),
     db: Session = Depends(get_db),
@@ -51,7 +63,15 @@ def get_complaints(
     return list(db.scalars(query).all())
 
 
-@router.get("/assigned", response_model=list[ComplaintResponse])
+@router.get(
+    "/assigned",
+    response_model=list[ComplaintResponse],
+    summary="Get Assigned Complaints — Maintenance Access Only",
+    description=(
+        "Maintenance Access Only. Returns complaints assigned to the authenticated "
+        "maintenance user."
+    ),
+)
 def get_assigned_complaints(
     current_user: User = Depends(require_roles("maintenance")),
     db: Session = Depends(get_db),
@@ -65,7 +85,12 @@ def get_assigned_complaints(
     )
 
 
-@router.get("/stats", response_model=ComplaintStatsResponse)
+@router.get(
+    "/stats",
+    response_model=ComplaintStatsResponse,
+    summary="Get Complaint Statistics — Admin Access Only",
+    description="Admin Access Only. Returns complaint and feedback statistics.",
+)
 def get_complaint_stats(
     current_user: User = Depends(require_roles("admin")),
     db: Session = Depends(get_db),
@@ -101,7 +126,12 @@ def get_complaint_stats(
     )
 
 
-@router.put("/{complaint_id}/assign", response_model=ComplaintResponse)
+@router.put(
+    "/{complaint_id}/assign",
+    response_model=ComplaintResponse,
+    summary="Assign Complaint — Admin Access Only",
+    description="Admin Access Only. Assigns a complaint to a maintenance user.",
+)
 def assign_complaint(
     complaint_id: int,
     assignment: ComplaintAssignment,
@@ -140,7 +170,15 @@ def assign_complaint(
     return complaint
 
 
-@router.get("/{complaint_id}", response_model=ComplaintResponse)
+@router.get(
+    "/{complaint_id}",
+    response_model=ComplaintResponse,
+    summary="Get Complaint — Student / Admin Access",
+    description=(
+        "Student / Admin Access. Students can view only their own complaints; "
+        "admins can view any complaint."
+    ),
+)
 def get_complaint(
     complaint_id: int,
     current_user: User = Depends(require_roles("student", "admin")),
@@ -162,6 +200,11 @@ def get_complaint(
     "/{complaint_id}/feedback",
     response_model=ComplaintFeedbackResponse,
     status_code=201,
+    summary="Submit Complaint Feedback — Student Access",
+    description=(
+        "Student Access. A student can submit feedback only for their own "
+        "resolved complaint. Successful feedback submission closes the complaint."
+    ),
 )
 def submit_complaint_feedback(
     complaint_id: int,
@@ -180,10 +223,10 @@ def submit_complaint_feedback(
             status_code=404,
             detail=f"Complaint with id {complaint_id} not found.",
         )
-    if complaint.status not in ("resolved", "closed"):
+    if complaint.status != "resolved":
         raise HTTPException(
             status_code=409,
-            detail="Feedback can only be submitted for resolved or closed complaints.",
+            detail="Feedback can only be submitted for resolved complaints.",
         )
 
     existing_feedback = db.scalar(
@@ -204,6 +247,7 @@ def submit_complaint_feedback(
         comment=feedback_data.comment,
     )
     db.add(feedback)
+    complaint.status = "closed"
     try:
         db.commit()
     except IntegrityError:
@@ -212,6 +256,9 @@ def submit_complaint_feedback(
             status_code=409,
             detail="Feedback has already been submitted for this complaint.",
         ) from None
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(feedback)
     logger.info(
         "Complaint feedback submitted (complaint_id=%s user_id=%s)",
@@ -221,7 +268,15 @@ def submit_complaint_feedback(
     return feedback
 
 
-@router.put("/{complaint_id}", response_model=ComplaintResponse)
+@router.put(
+    "/{complaint_id}",
+    response_model=ComplaintResponse,
+    summary="Update Complaint — Student / Admin Access",
+    description=(
+        "Student / Admin Access. Students can update only their own complaints; "
+        "admins can update any complaint."
+    ),
+)
 def update_complaint(
     complaint_id: int,
     update_data: ComplaintUpdate,
@@ -245,7 +300,15 @@ def update_complaint(
     return complaint
 
 
-@router.put("/{complaint_id}/status", response_model=ComplaintResponse)
+@router.put(
+    "/{complaint_id}/status",
+    response_model=ComplaintResponse,
+    summary="Update Complaint Status — Admin / Maintenance Access",
+    description=(
+        "Admin / Maintenance Access. Maintenance users can update status only for "
+        "complaints assigned to them; admins can update any complaint."
+    ),
+)
 def update_complaint_status(
     complaint_id: int,
     status_data: ComplaintStatusUpdate,
@@ -265,6 +328,8 @@ def update_complaint_status(
         )
 
     expected_status = STATUS_TRANSITIONS.get(complaint.status)
+    if current_user.role == "maintenance" and complaint.status == "resolved":
+        expected_status = None
     if status_data.status != expected_status:
         raise HTTPException(
             status_code=400,
@@ -273,6 +338,17 @@ def update_complaint_status(
                 f"to '{status_data.status}'."
             ),
         )
+    if status_data.status == "closed":
+        existing_feedback = db.scalar(
+            select(ComplaintFeedback).where(
+                ComplaintFeedback.complaint_id == complaint.id
+            )
+        )
+        if existing_feedback is None:
+            raise HTTPException(
+                status_code=409,
+                detail="A complaint can only be closed after student feedback is submitted.",
+            )
 
     complaint.status = status_data.status
     if complaint.status == "resolved":
@@ -288,7 +364,14 @@ def update_complaint_status(
     return complaint
 
 
-@router.delete("/{complaint_id}")
+@router.delete(
+    "/{complaint_id}",
+    summary="Delete Complaint — Student / Admin Access",
+    description=(
+        "Student / Admin Access. Students can delete only their own complaints; "
+        "admins can delete any complaint."
+    ),
+)
 def delete_complaint(
     complaint_id: int,
     current_user: User = Depends(require_roles("student", "admin")),
@@ -309,7 +392,15 @@ def delete_complaint(
     return {"message": f"Complaint with id {complaint_id} deleted successfully."}
 
 
-@router.post("/", response_model=ComplaintResponse)
+@router.post(
+    "/",
+    response_model=ComplaintResponse,
+    summary="Create Complaint — Student / Admin Access",
+    description=(
+        "Student / Admin Access. The complaint is created for the authenticated "
+        "user."
+    ),
+)
 def create_complaint(
     complaint_data: ComplaintCreate,
     current_user: User = Depends(require_roles("student", "admin")),

@@ -5,7 +5,7 @@ from unittest.mock import Mock
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.models import Complaint, User
+from app.models import Complaint, ComplaintFeedback, User
 from app.routers.complaints import router, update_complaint_status
 from app.schemas import ComplaintStatusUpdate, ComplaintUpdate
 
@@ -73,7 +73,13 @@ class ComplaintStatusWorkflowTests(unittest.TestCase):
             student_id=1,
         )
         db = Mock()
-        db.scalar.return_value = complaint
+        db.scalar.side_effect = [
+            complaint,
+            complaint,
+            complaint,
+            complaint,
+            ComplaintFeedback(id=1, complaint_id=12, student_id=1, rating=5),
+        ]
         admin = user_with_role("admin")
 
         update_complaint_status(12, ComplaintStatusUpdate(status="in_progress"), admin, db)
@@ -88,6 +94,69 @@ class ComplaintStatusWorkflowTests(unittest.TestCase):
         self.assertEqual(complaint.status, "closed")
         self.assertEqual(complaint.resolved_at, resolved_at)
         self.assertEqual(db.commit.call_count, 3)
+
+    def test_admin_cannot_close_resolved_complaint_without_feedback(self) -> None:
+        complaint = Complaint(
+            id=12,
+            title="Broken light",
+            description="Light is out",
+            category="Electrical",
+            priority="medium",
+            status="resolved",
+            location="Library",
+            student_id=1,
+        )
+        db = Mock()
+        db.scalar.side_effect = [complaint, None]
+
+        with self.assertRaises(HTTPException) as raised:
+            update_complaint_status(
+                12,
+                ComplaintStatusUpdate(status="closed"),
+                user_with_role("admin"),
+                db,
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(complaint.status, "resolved")
+        db.commit.assert_not_called()
+
+    def test_maintenance_can_advance_only_to_resolved(self) -> None:
+        complaint = Complaint(
+            id=12,
+            title="Broken light",
+            description="Light is out",
+            category="Electrical",
+            priority="medium",
+            status="pending",
+            location="Library",
+            student_id=1,
+            assigned_maintenance_id=1,
+        )
+        db = Mock()
+        db.scalar.side_effect = [complaint, complaint, complaint, None]
+        maintenance = user_with_role("maintenance")
+
+        update_complaint_status(
+            12, ComplaintStatusUpdate(status="in_progress"), maintenance, db
+        )
+        self.assertEqual(complaint.status, "in_progress")
+        self.assertIsNone(complaint.resolved_at)
+
+        update_complaint_status(
+            12, ComplaintStatusUpdate(status="resolved"), maintenance, db
+        )
+        self.assertEqual(complaint.status, "resolved")
+        self.assertIsInstance(complaint.resolved_at, datetime)
+
+        with self.assertRaises(HTTPException) as raised:
+            update_complaint_status(
+                12, ComplaintStatusUpdate(status="closed"), maintenance, db
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(complaint.status, "resolved")
+        self.assertEqual(db.commit.call_count, 2)
 
     def test_invalid_transition_is_rejected(self) -> None:
         complaint = Complaint(
